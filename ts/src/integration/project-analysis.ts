@@ -171,6 +171,26 @@ function safeGit(args: string[], opts: { cwd: string; timeout: number }): string
   }
 }
 
+/**
+ * Collect the candidate directories to search for project config files. The
+ * root directory is always included; shallow subdirectories (e.g. `ts/`,
+ * `src/`, `server/`, `client/` under a monorepo root) are also probed so a
+ * project whose tooling lives in a subproject is still detected.
+ */
+function collectConfigSearchDirs(dir: string): string[] {
+  const dirs = [dir];
+  try {
+    for (const entry of readdirSync(dir, { withFileTypes: true })) {
+      if (!entry.isDirectory() || entry.name.startsWith(".")) continue;
+      if (IGNORE_PATTERNS.includes(entry.name)) continue;
+      dirs.push(join(dir, entry.name));
+    }
+  } catch {
+    // ignore unreadable directories
+  }
+  return dirs;
+}
+
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
@@ -212,46 +232,64 @@ export async function detectProject(
   const configFiles: string[] = [];
   const technologies: string[] = [];
 
+  // Search the directory (and a few fixture/config subdirectories, e.g. a `ts/`
+  // frontend under a monorepo root) for project config files.
+  const configSearchDirs = collectConfigSearchDirs(dir);
+  const foundConfigPaths = configSearchDirs
+    .map((searchDir) =>
+      Object.values(PROJECT_CONFIGS)
+        .flatMap((configs) => configs)
+        .map((config) => join(searchDir, config))
+    )
+    .flat()
+    .filter((p) => existsSync(p) && statSync(p).isFile());
+
+  const resolvedConfigMap = new Map<string, string>();
+  for (const configPath of foundConfigPaths) {
+    const config = basename(configPath);
+    if (!resolvedConfigMap.has(config)) {
+      resolvedConfigMap.set(config, configPath);
+    }
+  }
+
   for (const [lang, configs] of Object.entries(PROJECT_CONFIGS)) {
     for (const config of configs) {
-      const configPath = join(dir, config);
-      if (existsSync(configPath) && statSync(configPath).isFile()) {
-        configFiles.push(config);
-        if (projectType === "unknown") projectType = lang;
+      const configPath = resolvedConfigMap.get(config);
+      if (!configPath) continue;
+      configFiles.push(config);
+      if (projectType === "unknown") projectType = lang;
 
-        // Parse config file for more details
-        if (config === "package.json") {
-          try {
-            const pkgData = JSON.parse(readFileSync(configPath, "utf-8"));
-            const dependencies: Record<string, unknown> = {
-              ...(pkgData["dependencies"] ?? {}),
-              ...(pkgData["devDependencies"] ?? {}),
-            };
-            for (const [framework, patterns] of Object.entries(FRAMEWORK_PATTERNS)) {
-              if (patterns.some((p) => Object.keys(dependencies).some((dep) => dep.includes(p)))) {
-                technologies.push(framework);
-              }
+      // Parse config file for more details
+      if (config === "package.json") {
+        try {
+          const pkgData = JSON.parse(readFileSync(configPath, "utf-8"));
+          const dependencies: Record<string, unknown> = {
+            ...(pkgData["dependencies"] ?? {}),
+            ...(pkgData["devDependencies"] ?? {}),
+          };
+          for (const [framework, patterns] of Object.entries(FRAMEWORK_PATTERNS)) {
+            if (patterns.some((p) => Object.keys(dependencies).some((dep) => dep.includes(p)))) {
+              technologies.push(framework);
             }
-          } catch {
-            // ignore parse errors
           }
-        } else if (config === "pyproject.toml") {
-          try {
-            const content = readFileSync(configPath, "utf-8");
-            for (const [framework, patterns] of Object.entries(FRAMEWORK_PATTERNS)) {
-              if (patterns.some((p) => content.includes(p))) {
-                technologies.push(framework);
-              }
+        } catch {
+          // ignore parse errors
+        }
+      } else if (config === "pyproject.toml") {
+        try {
+          const content = readFileSync(configPath, "utf-8");
+          for (const [framework, patterns] of Object.entries(FRAMEWORK_PATTERNS)) {
+            if (patterns.some((p) => content.includes(p))) {
+              technologies.push(framework);
             }
-          } catch {
-            // ignore read errors
           }
+        } catch {
+          // ignore read errors
         }
       }
     }
   }
 
-  // Determine detected types
   let detectedTypes = Object.entries(PROJECT_CONFIGS)
     .filter(([, configs]) => configs.some((c) => configFiles.includes(c)))
     .map(([lang]) => lang);
@@ -302,12 +340,13 @@ export async function detectProject(
       await backend.executeQuery(
         `
         MATCH (p:Memory {id: $project_id})
-        SET p.updated_at = datetime()
+        SET p.updated_at = $now
         RETURN p.id as id
         `,
         {
           project_id: project.project_id,
           git_remote: gitRemote,
+          now: new Date().toISOString(),
           project_type: projectType,
           technologies: uniqueTechnologies,
         },
@@ -529,10 +568,10 @@ export async function trackFileChanges(
       await backend.executeQuery(
         `
         MERGE (f:Entity {name: $file_path, type: 'file'})
-        ON CREATE SET f.id = $file_id, f.created_at = datetime()
+        ON CREATE SET f.id = $file_id, f.created_at = $now
         RETURN f.id as id
         `,
-        { file_path: filePath, file_id: fileId },
+        { file_path: filePath, file_id: fileId, now: new Date().toISOString() },
         true
       );
       await backend.createRelationship(

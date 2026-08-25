@@ -195,6 +195,23 @@ export async function generateSessionBriefing(
 
   console.info(`Generating session briefing for project: ${project.name}`);
 
+  // A memory belongs to a project when it carries the project path, or when
+  // it is unassigned (context_project_path is null). Unassigned memories are
+  // included so a briefing still reflects data that was captured without an
+  // explicit project association.
+  //
+  // The active match is path-boundary-aware: it matches an exact path or a
+  // path that equals a parent/first segment (i.e. the node path begins with
+  // `$project_path/`), unlike an unbounded substring CONTAINS which would
+  // let project `app` also match `/work/application` or `/other/app`.
+  const projectFilter = (node: string): string =>
+    `(${node}.context_project_path IS NULL OR ${node}.context_project_path = $project_path OR ${node}.context_project_path STARTS WITH $project_prefix)`;
+
+  // `$project_path/` — the directory boundary prefix for the STARTS WITH
+  // clause, so only direct children of the project path match (not unrelated
+  // paths sharing a common substring).
+  const projectPrefix = `${project.path}/`;
+
   const briefing: SessionBriefing = {
     project_name: project.name,
     project_path: project.path,
@@ -212,14 +229,14 @@ export async function generateSessionBriefing(
   // Total memory count
   const totalCountQuery = `
     MATCH (m:Memory)
-    WHERE m.context_project_path = $project_path OR m.context_project_path CONTAINS $project_name
+    WHERE ${projectFilter("m")}
     RETURN count(m) as total
   `;
 
   try {
     const result = await backend.executeQuery(totalCountQuery, {
       project_path: project.path,
-      project_name: project.name,
+      project_prefix: projectPrefix,
     });
     briefing.total_memories =
       result && result.length > 0 ? ((result[0]["total"] as number) ?? 0) : 0;
@@ -233,8 +250,8 @@ export async function generateSessionBriefing(
 
   const recentQuery = `
     MATCH (m:Memory)
-    WHERE (m.context_project_path = $project_path OR m.context_project_path CONTAINS $project_name)
-      AND datetime(m.created_at) >= datetime($cutoff)
+    WHERE ${projectFilter("m")}
+      AND m.created_at >= $cutoff
     RETURN m.id as id, m.type as type, m.title as title,
            m.summary as summary, m.created_at as created_at,
            m.tags as tags
@@ -245,7 +262,7 @@ export async function generateSessionBriefing(
   try {
     const results = await backend.executeQuery(recentQuery, {
       project_path: project.path,
-      project_name: project.name,
+      project_prefix: projectPrefix,
       cutoff: cutoffDate.toISOString(),
       limit: maxActivities,
     });
@@ -268,10 +285,8 @@ export async function generateSessionBriefing(
   // Unresolved problems
   const problemsQuery = `
     MATCH (p:Memory {type: 'problem'})
-    WHERE (p.context_project_path = $project_path OR p.context_project_path CONTAINS $project_name)
-      AND NOT EXISTS {
-        MATCH (p)<-[:SOLVES|ADDRESSES]-(:Memory)
-      }
+    WHERE ${projectFilter("p")}
+      AND NOT (p)<-[:SOLVES|ADDRESSES]-(:Memory)
     OPTIONAL MATCH (p)-[r]-()
     RETURN p.id as id, p.title as title, p.content as content,
            p.created_at as created_at, p.tags as tags,
@@ -283,7 +298,7 @@ export async function generateSessionBriefing(
   try {
     const results = await backend.executeQuery(problemsQuery, {
       project_path: project.path,
-      project_name: project.name,
+      project_prefix: projectPrefix,
     });
 
     for (const record of results ?? []) {
@@ -307,7 +322,7 @@ export async function generateSessionBriefing(
   // Relevant patterns
   const patternsQuery = `
     MATCH (m:Memory {type: 'code_pattern'})
-    WHERE m.context_project_path = $project_path OR m.context_project_path CONTAINS $project_name
+    WHERE ${projectFilter("m")}
     RETURN m.id as id, m.title as type, m.content as description,
            m.effectiveness as effectiveness, m.usage_count as usage_count,
            m.last_accessed as last_used
@@ -318,7 +333,7 @@ export async function generateSessionBriefing(
   try {
     const results = await backend.executeQuery(patternsQuery, {
       project_path: project.path,
-      project_name: project.name,
+      project_prefix: projectPrefix,
     });
 
     for (const record of results ?? []) {
@@ -350,7 +365,7 @@ export async function generateSessionBriefing(
   // Deprecation warnings
   const deprecatedQuery = `
     MATCH (old:Memory)-[r:DEPRECATED_BY]->(new:Memory)
-    WHERE old.context_project_path = $project_path OR old.context_project_path CONTAINS $project_name
+    WHERE ${projectFilter("old")}
     RETURN old.id as old_id, old.title as old_title,
            new.id as new_id, new.title as new_title,
            r.context as reason
@@ -360,7 +375,7 @@ export async function generateSessionBriefing(
   try {
     const results = await backend.executeQuery(deprecatedQuery, {
       project_path: project.path,
-      project_name: project.name,
+      project_prefix: projectPrefix,
     });
 
     for (const record of results ?? []) {

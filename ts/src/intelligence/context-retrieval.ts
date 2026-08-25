@@ -8,6 +8,7 @@
 
 import type { GraphBackend } from "../backends/index.js";
 import { extractEntities } from "./entity-extraction.js";
+import { parseDatetime } from "../utils/datetime.js";
 
 // ---------------------------------------------------------------------------
 // Return types
@@ -59,6 +60,16 @@ const STOP_WORDS = new Set([
   "who", "when", "where", "why", "how",
 ]);
 
+/**
+ * Parse a stored creation timestamp into a valid Date, or `null` if it is
+ * missing/invalid. Falls back to sharing the project-wide `parseDatetime`.
+ */
+function parseCreationDate(value: unknown): Date | null {
+  if (value === null || value === undefined) return null;
+  const dt = parseDatetime(value as string | Date);
+  return isNaN(dt.getTime()) ? null : dt;
+}
+
 // ---------------------------------------------------------------------------
 // Context retriever
 // ---------------------------------------------------------------------------
@@ -88,43 +99,33 @@ export class ContextRetriever {
     const searchQuery = `
       // Find memories matching entities or keywords
       MATCH (m:Memory)
+      OPTIONAL MATCH (m)-[:MENTIONS]->(me:Entity)
+      WITH m,
+        [x IN collect(DISTINCT me.text) WHERE x IS NOT NULL] as mentioned_entities
       WHERE (
-        any(entity IN $entities WHERE
-          exists((m)-[:MENTIONS]->(:Entity {text: entity}))
-        )
+        any(e IN mentioned_entities WHERE toLower(e) IN $lower_entities)
         OR
         any(keyword IN $keywords WHERE
           toLower(m.content) CONTAINS keyword OR
           toLower(m.title) CONTAINS keyword
         )
       )
-      WITH m
-      WHERE $project IS NULL OR $project IN m.tags
-
-      WITH m,
-        size([entity IN $entities WHERE
-              exists((m)-[:MENTIONS]->(:Entity {text: entity}))]) as entity_matches,
-        size([keyword IN $keywords WHERE
-              toLower(m.content) CONTAINS keyword OR
-              toLower(m.title) CONTAINS keyword]) as keyword_matches,
-        duration.between(m.created_at, datetime()).days as age_days
-
-      WITH m, entity_matches, keyword_matches, age_days,
-        toFloat(entity_matches * 3 + keyword_matches * 2) /
-        (1.0 + age_days / 30.0) as relevance_score
+      AND ($project IS NULL OR $project IN m.tags)
 
       OPTIONAL MATCH (m)-[r]->(related:Memory)
       WHERE type(r) IN ['SOLVES', 'BUILDS_ON', 'REQUIRES', 'RELATED_TO']
-      WITH m, relevance_score,
-        collect(DISTINCT {
+      // Filter null-id entries *inside* the collected list. When OPTIONAL
+      // MATCH finds no related memory it still emits one row with a null
+      // related/r; without the in-list filter an empty list id would be kept
+      // only by dropping the whole Memory row, which would remove standalone
+      // memories from ranking.
+      WITH m, mentioned_entities,
+        [x IN collect(DISTINCT {
           id: related.id,
           title: related.title,
           rel_type: type(r),
           rel_strength: coalesce(r.strength, 0.5)
-        }) as related_memories
-
-      ORDER BY relevance_score DESC, m.created_at DESC
-      LIMIT 20
+        }) WHERE x.id IS NOT NULL] as related_memories
 
       RETURN m.id as id,
              m.title as title,
@@ -132,14 +133,16 @@ export class ContextRetriever {
              m.type as memory_type,
              m.tags as tags,
              m.created_at as created_at,
-             relevance_score,
-             entity_matches,
-             keyword_matches,
-             related_memories
+             related_memories,
+             mentioned_entities
+      // Rank deterministically before capping so the LIMIT never drops an
+      // arbitrary slice of the matching set before the TS ranking runs.
+      ORDER BY m.created_at DESC
+      LIMIT 100
     `;
 
     const params: Record<string, unknown> = {
-      entities: entityTexts,
+      lower_entities: entityTexts.map((e) => e.toLowerCase()),
       keywords,
       project,
     };
@@ -147,12 +150,38 @@ export class ContextRetriever {
     try {
       const results = await this.backend.executeQuery(searchQuery, params, false);
 
+      const now = Date.now();
+      const ranked = results
+        .map((record) => {
+          const content = ((record["content"] as string) ?? "").toLowerCase();
+          const title = ((record["title"] as string) ?? "").toLowerCase();
+          const mentioned = (record["mentioned_entities"] as string[] | undefined) ?? [];
+          const mentionedLow = mentioned.map((t) => t.toLowerCase());
+          const lowerEntities = entityTexts.map((e) => e.toLowerCase());
+          let entityMatches = 0;
+          for (const e of lowerEntities) {
+            if (mentionedLow.includes(e)) entityMatches++;
+          }
+          let keywordMatches = 0;
+          for (const k of keywords) {
+            if (content.includes(k) || title.includes(k)) {
+              keywordMatches++;
+            }
+          }
+          const created = parseCreationDate(record["created_at"]);
+          const ageDays = created ? (now - created.getTime()) / (1000 * 60 * 60 * 24) : 30;
+          const relevanceScore =
+            (entityMatches * 3 + keywordMatches * 2) / (1.0 + ageDays / 30.0);
+          return { record, relevanceScore };
+        })
+        .sort((a, b) => b.relevanceScore - a.relevanceScore);
+
       const contextParts: string[] = [];
       const sourceMemories: SourceMemory[] = [];
       let estimatedTokens = 0;
 
-      for (const record of results) {
-        const memorySummary = this.formatMemory(record);
+      for (const { record, relevanceScore } of ranked) {
+        const memorySummary = this.formatMemory(record, relevanceScore ?? 0);
         const memoryTokens = this.estimateTokens(memorySummary);
 
         if (estimatedTokens + memoryTokens > maxTokens) {
@@ -163,7 +192,7 @@ export class ContextRetriever {
         sourceMemories.push({
           id: String(record["id"] ?? ""),
           title: (record["title"] as string | null | undefined) ?? null,
-          relevance: Number(record["relevance_score"] ?? 0),
+          relevance: Number(relevanceScore ?? 0),
         });
         estimatedTokens += memoryTokens;
       }
@@ -193,64 +222,109 @@ export class ContextRetriever {
    * Get comprehensive overview of a project.
    */
   async getProjectContext(project: string): Promise<ProjectSummary> {
-    const query = `
-      MATCH (m:Memory)
-      WHERE $project IN m.tags
-
-      WITH m
-      ORDER BY m.created_at DESC
-
-      WITH collect(m) as all_memories
-
-      WITH all_memories,
-        [m IN all_memories WHERE m.created_at >= datetime() - duration({days: 7})][..10] as recent,
-        [m IN all_memories WHERE m.type = 'decision'][..5] as decisions,
-        [m IN all_memories WHERE m.type = 'problem' AND
-         NOT exists((m)<-[:SOLVES]-(:Memory))][..5] as open_problems,
-        [m IN all_memories WHERE m.type = 'solution'][..5] as solutions
-
-      RETURN {
-        total_memories: size(all_memories),
-        recent_activity: [m IN recent | {
-          id: m.id,
-          title: m.title,
-          type: m.type,
-          created_at: m.created_at
-        }],
-        decisions: [m IN decisions | {
-          id: m.id,
-          title: m.title,
-          created_at: m.created_at
-        }],
-        open_problems: [m IN open_problems | {
-          id: m.id,
-          title: m.title,
-          created_at: m.created_at
-        }],
-        solutions: [m IN solutions | {
-          id: m.id,
-          title: m.title,
-          created_at: m.created_at
-        }]
-      } as project_summary
-    `;
-
     const params = { project };
 
+    // Each query pushes its cap into the database (ORDER BY + LIMIT) instead
+    // of dragging every project memory back into one unbounded collect() row.
+    // total_memories comes from a dedicated count(m) query.
+    const countQuery = `
+      MATCH (m:Memory)
+      WHERE $project IN m.tags
+      RETURN count(m) as total
+    `;
+    const openQuery = `
+      MATCH (m:Memory)
+      WHERE $project IN m.tags
+        AND m.type = 'problem'
+        AND NOT (m)<-[:SOLVES|ADDRESSES]-(:Memory)
+      RETURN m.id as id, m.title as title, m.type as type, m.created_at as created_at
+      ORDER BY m.created_at DESC
+      LIMIT 5
+    `;
+    const recentQuery = `
+      MATCH (m:Memory)
+      WHERE $project IN m.tags
+      RETURN m.id as id, m.title as title, m.type as type, m.created_at as created_at
+      ORDER BY m.created_at DESC
+      LIMIT 10
+    `;
+    const decisionsQuery = `
+      MATCH (m:Memory)
+      WHERE $project IN m.tags AND m.type = 'decision'
+      RETURN m.id as id, m.title as title, m.type as type, m.created_at as created_at
+      ORDER BY m.created_at DESC
+      LIMIT 5
+    `;
+    const solutionsQuery = `
+      MATCH (m:Memory)
+      WHERE $project IN m.tags AND m.type = 'solution'
+      RETURN m.id as id, m.title as title, m.type as type, m.created_at as created_at
+      ORDER BY m.created_at DESC
+      LIMIT 5
+    `;
+
     try {
-      const results = await this.backend.executeQuery(query, params, false);
-      if (results.length > 0) {
-        const summary = results[0]["project_summary"];
-        if (summary && typeof summary === "object") {
-          return summary as ProjectSummary;
-        }
-      }
+      const [countRes, openRes, recentRes, decisionsRes, solutionsRes] =
+        await Promise.all([
+          this.backend.executeQuery(countQuery, params, false),
+          this.backend.executeQuery(openQuery, params, false),
+          this.backend.executeQuery(recentQuery, params, false),
+          this.backend.executeQuery(decisionsQuery, params, false),
+          this.backend.executeQuery(solutionsQuery, params, false),
+        ]);
+
+      const totalMemories =
+        countRes.length > 0 ? Number(countRes[0]["total"] ?? 0) : 0;
+
+      // Cap to the recent window (7 days) in JS, matching the prior behaviour
+      // while remaining length-bounded by the query LIMIT above.
+      const now = Date.now();
+      const weekMs = 7 * 24 * 60 * 60 * 1000;
+      const recent = (recentRes ?? []).filter((m) => {
+        const created = parseCreationDate(m["created_at"]);
+        return created !== null && now - created.getTime() <= weekMs;
+      });
+
+      const sortByCreatedDesc = (a: Record<string, unknown>, b: Record<string, unknown>) => {
+        const ta = parseCreationDate(a["created_at"]);
+        const tb = parseCreationDate(b["created_at"]);
+        const va = ta ? ta.getTime() : 0;
+        const vb = tb ? tb.getTime() : 0;
+        return vb - va;
+      };
+
+      const openProblems = (openRes ?? [])
+        .slice()
+        .sort(sortByCreatedDesc)
+        .slice(0, 5);
+      const decisions = (decisionsRes ?? []).slice().sort(sortByCreatedDesc).slice(0, 5);
+      const solutions = (solutionsRes ?? []).slice().sort(sortByCreatedDesc).slice(0, 5);
+
+      const toSummary = (m: Record<string, unknown>) => ({
+        id: m["id"],
+        title: m["title"],
+        type: m["type"],
+        created_at: m["created_at"],
+      });
+
       return {
-        total_memories: 0,
-        recent_activity: [],
-        decisions: [],
-        open_problems: [],
-        solutions: [],
+        total_memories: totalMemories,
+        recent_activity: recent.map(toSummary),
+        decisions: decisions.map((d) => ({
+          id: d["id"],
+          title: d["title"],
+          created_at: d["created_at"],
+        })),
+        open_problems: openProblems.map((d) => ({
+          id: d["id"],
+          title: d["title"],
+          created_at: d["created_at"],
+        })),
+        solutions: solutions.map((d) => ({
+          id: d["id"],
+          title: d["title"],
+          created_at: d["created_at"],
+        })),
       };
     } catch (e) {
       const message = e instanceof Error ? e.message : String(e);
@@ -265,7 +339,7 @@ export class ContextRetriever {
   async getSessionContext(hoursBack = 24, limit = 10): Promise<SessionContext> {
     const query = `
       MATCH (m:Memory)
-      WHERE m.created_at >= datetime() - duration({hours: $hours_back})
+      WHERE m.created_at >= $cutoff
 
       WITH m
       ORDER BY m.created_at DESC
@@ -283,7 +357,8 @@ export class ContextRetriever {
       ORDER BY m.created_at DESC
     `;
 
-    const params = { hours_back: hoursBack, limit };
+    const cutoff = new Date(Date.now() - hoursBack * 60 * 60 * 1000).toISOString();
+    const params = { cutoff, limit };
 
     try {
       const results = await this.backend.executeQuery(query, params, false);
@@ -326,11 +401,11 @@ export class ContextRetriever {
   // Private helpers
   // -----------------------------------------------------------------------
 
-  private formatMemory(record: Record<string, unknown>): string {
+  private formatMemory(record: Record<string, unknown>, relevanceScore = 0): string {
     const title = (record["title"] as string | null | undefined) ?? "Untitled";
     const memoryType = (record["memory_type"] as string | null | undefined) ?? "unknown";
     let content = (record["content"] as string | null | undefined) ?? "";
-    const relevance = Number(record["relevance_score"] ?? 0);
+    const relevance = Number(relevanceScore ?? 0);
 
     if (content.length > 500) {
       content = content.slice(0, 497) + "...";
